@@ -4,7 +4,7 @@ import tempfile
 import threading
 import time
 from urllib.parse import quote
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
 from fastapi.responses import StreamingResponse
 from yt_dlp import YoutubeDL
 import logging
@@ -14,66 +14,94 @@ logging.basicConfig(level=logging.INFO)
 
 app = FastAPI()
 
-# yt-dlp options to remove watermarks where possible
-YDL_OPTIONS = {
-    'outtmpl': '%(title)s.%(ext)s',
-    'format': 'best',
+# Common download options
+BASE_OPTIONS = {
     'noplaylist': True,
     'quiet': True,
-    'merge_output_format': 'mp4',
-    'max_filesize': 2 * 1024 * 1024 * 1024,  # Set max file size to 2GB
-    'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}],
     'restrictfilenames': True,
+    'max_filesize': 2 * 1024 * 1024 * 1024,  # 2GB
 }
 
-# Some sites like TikTok require special options to avoid watermark
-TIKTOK_OPTIONS = {
-    **YDL_OPTIONS,
+# Mode-specific options
+OPTIONS_WITH_WATERMARK = {
+    **BASE_OPTIONS,
+    'format': 'bv*+ba/bestvideo+bestaudio/best',
+    'merge_output_format': 'mp4',
+    'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}],
+}
+
+OPTIONS_NO_WATERMARK = {
+    **OPTIONS_WITH_WATERMARK,
     'extractor_args': {'tiktok': {'no_watermark': True}},
 }
 
-def download_video(url: str) -> tuple[str, str]:
-    """Downloads the video and returns the file path and temp directory."""
+OPTIONS_MP3 = {
+    **BASE_OPTIONS,
+    'format': 'bestaudio/best',
+    'postprocessors': [
+        {
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }
+    ],
+    'outtmpl': '%(title)s.%(ext)s',
+}
+
+def get_options(mode: str, temp_dir: str):
+    options = OPTIONS_WITH_WATERMARK
+    if mode == 'no_watermark':
+        options = OPTIONS_NO_WATERMARK
+    elif mode == 'mp3':
+        options = OPTIONS_MP3
+    options = options.copy()
+    options['outtmpl'] = os.path.join(temp_dir, '%(title)s.%(ext)s')
+    return options
+
+def download_video(url: str, mode: str) -> tuple[str, str]:
+    """Downloads the video or audio and returns file path."""
     temp_dir = tempfile.mkdtemp()
-    YDL_OPTIONS['outtmpl'] = os.path.join(temp_dir, '%(title)s.%(ext)s')
-    
+    options = get_options(mode, temp_dir)
     try:
-        with YoutubeDL(YDL_OPTIONS if "tiktok.com" not in url else TIKTOK_OPTIONS) as ydl:
+        with YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=True)
             file_path = ydl.prepare_filename(info)
-            return file_path
+            # Append .mp3 extension manually if it's audio-only
+            if mode == "mp3":
+                file_path = os.path.splitext(file_path)[0] + ".mp3"
+            return file_path, temp_dir
     except Exception as e:
+        shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(status_code=400, detail=str(e))
 
 def schedule_deletion(directory: str, delay: int = 120):
-    """Deletes the specified directory after a delay (default: 2 minutes)."""
+    """Deletes the directory after a delay."""
     def delete():
         time.sleep(delay)
         if os.path.exists(directory):
-            os.remove(directory)
-            logging.info(f"File {directory} deleted.")
-        else:
-            logging.info("File not found")
-
+            shutil.rmtree(directory, ignore_errors=True)
+            logging.info(f"Deleted temp dir: {directory}")
     threading.Thread(target=delete, daemon=True).start()
 
-
-def file_streamer(file_path):
-    """Yields video file data in chunks to prevent memory overflow."""
+def file_streamer(file_path: str):
     with open(file_path, "rb") as f:
         yield from f
 
 @app.get("/download/")
-def download(url: str, background_tasks: BackgroundTasks):
-    """API to download a video in the background and stream it."""
-    file_path = download_video(url) # Schedule deletion
-
-    # Encode the filename to avoid Unicode errors
-    safe_filename = quote(os.path.basename(file_path))
+def download(url: str, mode: str = Query("no_watermark", enum=["no_watermark", "with_watermark", "mp3"]), background_tasks: BackgroundTasks = None):
+    """Downloads a video (with/without watermark) or audio (mp3)"""
+    file_path, temp_dir = download_video(url, mode)
+    filename = quote(os.path.basename(file_path))
 
     headers = {
-        "Content-Disposition": f'attachment; filename*=UTF-8\'\'{safe_filename}'
+        "Content-Disposition": f"attachment; filename*=UTF-8''{filename}"
     }
 
-    
-    return StreamingResponse(file_streamer(file_path), media_type="video/mp4", headers=headers, background=BackgroundTask(schedule_deletion, safe_filename, 60))
+    media_type = "audio/mpeg" if mode == "mp3" else "video/mp4"
+
+    return StreamingResponse(
+        file_streamer(file_path),
+        media_type=media_type,
+        headers=headers,
+        background=BackgroundTask(schedule_deletion, temp_dir, 60)
+    )
