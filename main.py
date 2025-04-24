@@ -12,7 +12,17 @@ from starlette.background import BackgroundTask
 
 logging.basicConfig(level=logging.INFO)
 
+from fastapi.middleware.cors import CORSMiddleware
+
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Replace "*" with your frontend origin in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 # Common download options
 BASE_OPTIONS = {
